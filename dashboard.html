@@ -1,0 +1,897 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Beach Dashboard</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; cursor: none; }
+  #scene { position: fixed; inset: 0; width: 100vw; height: 100vh; image-rendering: pixelated; image-rendering: crisp-edges; }
+  .panel { position: fixed; }
+  #sprite { position: fixed; image-rendering: pixelated; pointer-events: none; filter: drop-shadow(0 0 4px rgba(255, 255, 255, .22)); }
+  #dim { position: fixed; inset: 0; background: #000; opacity: 0; pointer-events: none; transition: opacity 3s; }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<canvas id="pClock" class="panel"></canvas>
+<canvas id="pWeather" class="panel"></canvas>
+<canvas id="pPoke" class="panel"></canvas>
+<canvas id="pVerse" class="panel"></canvas>
+<canvas id="pTicker" class="panel"></canvas>
+<img id="sprite" alt="">
+<div id="dim"></div>
+
+<script>
+/* ======================= SETTINGS — edit these ======================= */
+const CONFIG = {
+  city: "Gainesville",         // your city
+  region: "Florida",           // optional state or country to pick the right city, e.g. "Texas"
+  lat: null, lon: null,        // or set exact coordinates instead of a city
+
+  units: "fahrenheit",         // "fahrenheit" or "celsius"
+  clock24h: false,
+
+  leagues: ["nfl", "nba"],     // scores in the scrolling bar
+  bibleTranslation: "webbe",   // "webbe" (modern English), "kjv" (King James) or "web"
+
+  tickerSpeed: 22,             // LED dots per second
+  versePageSeconds: 10,        // long verses flip pages this often
+  nightDim: { from: 23, to: 6, level: 0.6 },   // dim the screen between these hours (level 0 = off)
+};
+/* ===================================================================== */
+
+const LEAGUES = {
+  "nfl":              { path: "football/nfl",              label: "NFL",   color: "#ff5a4e" },
+  "nba":              { path: "basketball/nba",            label: "NBA",   color: "#ff9a3c" },
+  "college-football": { path: "football/college-football", label: "NCAAF", color: "#5ad1ff" },
+  "mlb":              { path: "baseball/mlb",              label: "MLB",   color: "#6fe07a" },
+  "nhl":              { path: "hockey/nhl",                label: "NHL",   color: "#b48cff" },
+};
+
+// Settings can also come from the page address, e.g. dashboard.html?city=Denver&region=Colorado&translation=kjv
+// Preview helpers: ?time=19:05 (fixed time), ?demo=60 (a whole day in 60 s), ?weather=rain, ?pokemon=25
+const Q = new URLSearchParams(location.search);
+if (Q.has("city")) CONFIG.city = Q.get("city");
+if (Q.has("region")) CONFIG.region = Q.get("region");
+if (Q.has("lat") && Q.has("lon")) { CONFIG.lat = Number(Q.get("lat")); CONFIG.lon = Number(Q.get("lon")); }
+if (Q.has("units")) CONFIG.units = Q.get("units");
+if (Q.has("clock24h")) CONFIG.clock24h = Q.get("clock24h") === "true";
+if (Q.has("leagues")) CONFIG.leagues = Q.get("leagues").split(",").map((s) => s.trim()).filter((k) => k in LEAGUES);
+if (Q.has("translation")) CONFIG.bibleTranslation = Q.get("translation");
+const DEBUG = { time: Q.get("time"), demo: Q.has("demo") ? Number(Q.get("demo")) || 60 : 0, weather: Q.get("weather"), pokemon: Q.get("pokemon"), verse: Q.get("verse") };
+
+/* ---------------- Small helpers ---------------- */
+const BOOT = Date.now();
+function now() {
+  if (DEBUG.demo) {
+    const d0 = new Date(); d0.setHours(0, 0, 0, 0);
+    const f = (5 / 24 + (Date.now() - BOOT) / 1000 / DEBUG.demo) % 1;
+    return new Date(d0.getTime() + f * 86400e3);
+  }
+  if (DEBUG.time) {
+    const [h, m] = DEBUG.time.split(":").map(Number);
+    const d = new Date(); d.setHours(h, m || 0, d.getSeconds(), 0); return d;
+  }
+  return new Date();
+}
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const hex2rgb = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
+const mix = (a, b, t) => [0, 1, 2].map((i) => Math.round(lerp(a[i], b[i], t)));
+const rgb = (c, a = 1) => a >= 1 ? `rgb(${c[0]},${c[1]},${c[2]})` : `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+function mulberry32(seed) { return () => { seed |= 0; seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+function hashStr(s) { let h = 2166136261; for (const c of s) { h ^= c.charCodeAt(0); h = Math.imul(h, 16777619); } return h >>> 0; }
+function hash2(x, y, z = 0) { let h = Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263) + Math.imul(z | 0, 2147483647); h = Math.imul(h ^ (h >>> 13), 1274126177); return ((h ^ (h >>> 16)) >>> 0) / 4294967296; }
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map((v) => (v + 0.5) / 16);
+const bayer = (x, y) => BAYER[(y & 3) * 4 + (x & 3)];
+const todayKey = (d = now()) => `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+const fmtTime = (d) => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", hour12: !CONFIG.clock24h });
+async function getJSON(url) { const r = await fetch(url); if (!r.ok) throw new Error(r.status); return r.json(); }
+function cacheGet(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }
+function cacheSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+
+/* =====================================================================
+   LED dot-matrix text: 5x7 font (with descenders), drawn as glowing LEDs
+   ===================================================================== */
+const FONT_SRC = {
+  " ": ".....", "!": "..#.. ..#.. ..#.. ..#.. ..#.. ..... ..#..", '"': ".#.#. .#.#.",
+  "#": ".#.#. .#.#. ##### .#.#. ##### .#.#. .#.#.", "$": "..#.. .#### #.#.. .###. ..#.# ####. ..#..",
+  "%": "##... ##..# ...#. ..#.. .#... #..## ...##", "&": ".##.. #..#. #.#.. .#... #.#.# #..#. .##.#",
+  "'": "..#.. ..#.. .#...", "(": "...#. ..#.. .#... .#... .#... ..#.. ...#.", ")": ".#... ..#.. ...#. ...#. ...#. ..#.. .#...",
+  "*": "..... ..#.. #.#.# .###. #.#.# ..#..", "+": "..... ..#.. ..#.. ##### ..#.. ..#..",
+  ",": "..... ..... ..... ..... ..... .##.. ..#.. .#...", "-": "..... ..... ..... ####.",
+  ".": "..... ..... ..... ..... ..... .##.. .##..", "/": "...#. ...#. ..#.. ..#.. ..#.. .#... .#...",
+  "0": ".###. #...# #...# #...# #...# #...# .###.", "1": "..#.. .##.. ..#.. ..#.. ..#.. ..#.. .###.",
+  "2": ".###. #...# ....# ...#. ..#.. .#... #####", "3": ".###. #...# ....# ..##. ....# #...# .###.",
+  "4": "...#. ..##. .#.#. #..#. ##### ...#. ...#.", "5": "##### #.... ####. ....# ....# #...# .###.",
+  "6": "..##. .#... #.... ####. #...# #...# .###.", "7": "##### ....# ...#. ..#.. .#... .#... .#...",
+  "8": ".###. #...# #...# .###. #...# #...# .###.", "9": ".###. #...# #...# .#### ....# ...#. .##..",
+  ":": "..... .##.. .##.. ..... .##.. .##..", ";": "..... .##.. .##.. ..... .##.. ..#.. .#...",
+  "<": "...#. ..#.. .#... #.... .#... ..#.. ...#.", "=": "..... ..... ##### ..... #####",
+  ">": ".#... ..#.. ...#. ....# ...#. ..#.. .#...", "?": ".###. #...# ....# ...#. ..#.. ..... ..#..",
+  "@": ".###. #...# #.### #.#.# #.### #.... .###.",
+  "A": ".###. #...# #...# ##### #...# #...# #...#", "B": "####. #...# #...# ####. #...# #...# ####.",
+  "C": ".###. #...# #.... #.... #.... #...# .###.", "D": "###.. #..#. #...# #...# #...# #..#. ###..",
+  "E": "##### #.... #.... ####. #.... #.... #####", "F": "##### #.... #.... ####. #.... #.... #....",
+  "G": ".###. #...# #.... #.### #...# #...# .####", "H": "#...# #...# #...# ##### #...# #...# #...#",
+  "I": ".###. ..#.. ..#.. ..#.. ..#.. ..#.. .###.", "J": "..### ...#. ...#. ...#. ...#. #..#. .##..",
+  "K": "#...# #..#. #.#.. ##... #.#.. #..#. #...#", "L": "#.... #.... #.... #.... #.... #.... #####",
+  "M": "#...# ##.## #.#.# #.#.# #...# #...# #...#", "N": "#...# #...# ##..# #.#.# #..## #...# #...#",
+  "O": ".###. #...# #...# #...# #...# #...# .###.", "P": "####. #...# #...# ####. #.... #.... #....",
+  "Q": ".###. #...# #...# #...# #.#.# #..#. .##.#", "R": "####. #...# #...# ####. #.#.. #..#. #...#",
+  "S": ".#### #.... #.... .###. ....# ....# ####.", "T": "##### ..#.. ..#.. ..#.. ..#.. ..#.. ..#..",
+  "U": "#...# #...# #...# #...# #...# #...# .###.", "V": "#...# #...# #...# #...# #...# .#.#. ..#..",
+  "W": "#...# #...# #...# #.#.# #.#.# #.#.# .#.#.", "X": "#...# #...# .#.#. ..#.. .#.#. #...# #...#",
+  "Y": "#...# #...# #...# .#.#. ..#.. ..#.. ..#..", "Z": "##### ....# ...#. ..#.. .#... #.... #####",
+  "[": "###.. #.... #.... #.... #.... #.... ###..", "]": "..### ....# ....# ....# ....# ....# ..###",
+  "_": "..... ..... ..... ..... ..... ..... #####", "|": "..#.. ..#.. ..#.. ..#.. ..#.. ..#.. ..#..",
+  "a": "..... ..... .###. ....# .#### #...# .####", "b": "#.... #.... #.##. ##..# #...# #...# ####.",
+  "c": "..... ..... .###. #.... #.... #...# .###.", "d": "....# ....# .##.# #..## #...# #...# .####",
+  "e": "..... ..... .###. #...# ##### #.... .###.", "f": "..##. .#..# .#... ###.. .#... .#... .#...",
+  "g": "..... ..... .#### #...# #...# #...# .#### ....# .###.", "h": "#.... #.... #.##. ##..# #...# #...# #...#",
+  "i": "..#.. ..... .##.. ..#.. ..#.. ..#.. .###.", "j": "...#. ..... ..##. ...#. ...#. ...#. ...#. #..#. .##..",
+  "k": "#.... #.... #..#. #.#.. ##... #.#.. #..#.", "l": ".##.. ..#.. ..#.. ..#.. ..#.. ..#.. .###.",
+  "m": "..... ..... ##.#. #.#.# #.#.# #...# #...#", "n": "..... ..... #.##. ##..# #...# #...# #...#",
+  "o": "..... ..... .###. #...# #...# #...# .###.", "p": "..... ..... ####. #...# #...# #...# ####. #.... #....",
+  "q": "..... ..... .#### #...# #...# #...# .#### ....# ....#", "r": "..... ..... #.##. ##..# #.... #.... #....",
+  "s": "..... ..... .#### #.... .###. ....# ####.", "t": ".#... .#... ###.. .#... .#... .#..# ..##.",
+  "u": "..... ..... #...# #...# #...# #..## .##.#", "v": "..... ..... #...# #...# #...# .#.#. ..#..",
+  "w": "..... ..... #...# #...# #.#.# #.#.# .#.#.", "x": "..... ..... #...# .#.#. ..#.. .#.#. #...#",
+  "y": "..... ..... #...# #...# #...# #...# .#### ....# .###.", "z": "..... ..... ##### ...#. ..#.. .#... #####",
+  "°": ".##.. #..#. #..#. .##..", "•": "..... ..... ..... .##.. .##..",
+  "♀": ".###. #...# #...# .###. ..#.. .###. ..#..", "♂": "..### ...## .##.# #..#. #..#. .##..",
+};
+const GLYPH = {};
+for (const [ch, src] of Object.entries(FONT_SRC)) {
+  const rows = src.split(" ");
+  while (rows.length < 9) rows.push(".....");
+  let c0 = 5, c1 = -1;
+  rows.forEach((r) => { for (let c = 0; c < 5; c++) if (r[c] === "#") { c0 = Math.min(c0, c); c1 = Math.max(c1, c); } });
+  GLYPH[ch] = { rows, c0: c1 < 0 ? 0 : c0, w: c1 < 0 ? 3 : c1 - c0 + 1 };
+}
+const DIGITS = new Set("0123456789");
+function cleanText(s) {
+  return String(s)
+    .replace(/[‘’ʼ′]/g, "'").replace(/[“”″]/g, '"').replace(/[–—―]/g, "-").replace(/…/g, "...")
+    .normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/\s+/g, " ").trim();
+}
+const glyphOf = (ch) => GLYPH[ch] || GLYPH["?"];
+function textWidth(str, s = 1, tabular = false) {
+  let w = 0;
+  for (const ch of str) w += ((tabular && DIGITS.has(ch)) ? 5 : glyphOf(ch).w) + 1;
+  return Math.max(0, w - 1) * s;
+}
+
+let P = 4, DPR = 1;                 // P = CSS pixels per LED dot (= one pixel of the beach scene)
+const GLOW = 0.9;
+const dotCache = new Map();
+function dotSprite(color) {
+  let sp = dotCache.get(color);
+  if (sp) return sp;
+  const size = Math.max(4, Math.ceil(P * DPR * (1 + 2 * GLOW)));
+  sp = document.createElement("canvas"); sp.width = sp.height = size;
+  const g = sp.getContext("2d"), r = size / 2, cell = size / (1 + 2 * GLOW), c = hex2rgb(color);
+  let grd = g.createRadialGradient(r, r, 0, r, r, r);
+  grd.addColorStop(0, rgb(c, 0.42)); grd.addColorStop(0.5, rgb(c, 0.12)); grd.addColorStop(1, rgb(c, 0));
+  g.fillStyle = grd; g.fillRect(0, 0, size, size);
+  const core = cell * 0.43;
+  grd = g.createRadialGradient(r - core * 0.3, r - core * 0.3, 0, r, r, core);
+  grd.addColorStop(0, rgb(mix(c, [255, 255, 255], 0.6))); grd.addColorStop(0.75, rgb(c)); grd.addColorStop(1, rgb(c, 0.8));
+  g.fillStyle = grd; g.beginPath(); g.arc(r, r, core, 0, Math.PI * 2); g.fill();
+  dotCache.set(color, sp);
+  return sp;
+}
+function dot(ctx, x, y, color) { ctx.drawImage(dotSprite(color), x - GLOW, y - GLOW, 1 + 2 * GLOW, 1 + 2 * GLOW); }
+
+// Draws text at dot position (x, y). Returns the x just past the last glyph.
+function drawText(ctx, str, x, y, s, color, opt = {}) {
+  let cx = x;
+  for (const ch of str) {
+    const g = glyphOf(ch), tab = opt.tabular && DIGITS.has(ch);
+    const w = tab ? 5 : g.w, c0 = tab ? 0 : g.c0, col = typeof color === "function" ? color(ch) : color;
+    if (opt.maxX && cx + w * s > opt.maxX) break;
+    if (opt.minX == null || cx + w * s >= opt.minX) {
+      for (let r = 0; r < 9; r++) {
+        const row = g.rows[r];
+        for (let c = 0; c < 5; c++) {
+          if (row[c] !== "#") continue;
+          const px = cx + (c - c0) * s, py = y + r * s;
+          for (let a = 0; a < s; a++) for (let b = 0; b < s; b++) dot(ctx, px + a, py + b, col);
+        }
+      }
+    }
+    cx += (w + 1) * s;
+  }
+  return cx - s;
+}
+
+// Multi-colour LED icons: each letter is a colour, "." is off.
+const ICON_COLORS = { y: "#ffd23f", w: "#f2f6ff", g: "#9eabc2", b: "#4aa8ff", s: "#ffffff", m: "#efe8c8", l: "#ffe14a" };
+const I_SUN = [".....y.....", ".y...y...y.", "..y.....y..", "....yyy....", "...yyyyy...", "yy.yyyyy.yy", "...yyyyy...", "....yyy....", "..y.....y..", ".y...y...y.", ".....y....."];
+const I_MOON = ["...mmmm....", ".mmmm......", ".mmm.......", "mmm........", "mmm........", "mmm........", "mmm.......m", ".mmm.....mm", ".mmmm..mmm.", "..mmmmmmm..", "....mmm...."];
+const I_CLOUD = [".....www.....", "...wwwwwww...", "..wwwwwwwww..", ".wwwwwwwwwww.", "wwwwwwwwwwwww", "wwwwwwwwwwwww", ".ggggggggggg."];
+const I_SUN_S = ["...y...", ".y.y.y.", "..yyy..", "yyyyyyy", "..yyy..", ".y.y.y.", "...y..."];
+const I_MOON_S = ["..mmm.", ".mm...", "mm....", "mm....", "mm....", ".mm..m", "..mmm."];
+function composeIcon(w, h, parts) {
+  const out = Array.from({ length: h }, () => Array(w).fill("."));
+  for (const [rows, ox, oy] of parts) rows.forEach((r, y) => [...r].forEach((ch, x) => { if (ch !== ".") out[oy + y][ox + x] = ch; }));
+  return out.map((r) => r.join(""));
+}
+const ICONS = {
+  sun: I_SUN, moon: I_MOON, cloud: I_CLOUD,
+  partSun: composeIcon(15, 11, [[I_SUN_S, 0, 0], [I_CLOUD, 2, 4]]),
+  partMoon: composeIcon(15, 11, [[I_MOON_S, 1, 0], [I_CLOUD, 2, 4]]),
+  rain: composeIcon(13, 11, [[I_CLOUD, 0, 0], [["..b...b...b..", ".b...b...b...", "b...b...b...."], 0, 8]]),
+  snow: composeIcon(13, 11, [[I_CLOUD, 0, 0], [["..s...s...s..", ".............", "s...s...s...s"], 0, 8]]),
+  storm: composeIcon(13, 11, [[I_CLOUD, 0, 0], [["......ll", ".....ll.", "....llll", "......l."], 0, 7]]),
+  fog: ["ggggggggggggg", ".............", ".ggggggggggg.", ".............", "ggggggggggggg", ".............", "..ggggggggg.."],
+};
+// Smaller icons for the 3-day forecast
+const M_CLOUD = ["...www...", ".wwwwwww.", "wwwwwwwww", "wwwwwwwww", ".ggggggg."];
+const M_SUN = ["..y..", ".yyy.", "yyyyy", ".yyy.", "..y.."];
+const ICONS_MINI = {
+  sun: I_SUN_S, moon: I_MOON_S, cloud: M_CLOUD,
+  partSun: composeIcon(10, 7, [[M_SUN, 0, 0], [M_CLOUD, 1, 2]]), partMoon: composeIcon(10, 7, [[M_SUN, 0, 0], [M_CLOUD, 1, 2]]),
+  rain: composeIcon(9, 7, [[M_CLOUD, 0, 0], [["b.b.b.b..", ".b.b.b.b."], 0, 5]]),
+  snow: composeIcon(9, 7, [[M_CLOUD, 0, 0], [["s...s...s", "..s...s.."], 0, 5]]),
+  storm: composeIcon(9, 7, [[M_CLOUD, 0, 0], [["....ll...", "...ll...."], 0, 5]]),
+  fog: ["ggggggggg", ".........", "ggggggggg", ".........", ".ggggggg."],
+};
+function drawIcon(ctx, rows, x, y, s) {
+  rows.forEach((r, yy) => [...r].forEach((ch, xx) => {
+    if (ch === ".") return;
+    for (let a = 0; a < s; a++) for (let b = 0; b < s; b++) dot(ctx, x + xx * s + a, y + yy * s + b, ICON_COLORS[ch]);
+  }));
+}
+
+/* ---------------- LED panels ---------------- */
+function roundRect(g, x, y, w, h, r) {
+  g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+}
+class Panel {
+  constructor(id) { this.cv = document.getElementById(id); this.ctx = this.cv.getContext("2d"); }
+  place(x, y, w, h) {
+    Object.assign(this, { x, y, w, h });
+    Object.assign(this.cv.style, { left: x * P + "px", top: y * P + "px", width: w * P + "px", height: h * P + "px" });
+    this.cv.width = Math.round(w * P * DPR); this.cv.height = Math.round(h * P * DPR);
+    // background + every unlit LED, drawn once
+    const bg = document.createElement("canvas"); bg.width = this.cv.width; bg.height = this.cv.height;
+    const g = bg.getContext("2d"); g.setTransform(P * DPR, 0, 0, P * DPR, 0, 0);
+    roundRect(g, 0.2, 0.2, w - 0.4, h - 0.4, 2.4); g.fillStyle = "rgba(3,5,12,0.76)"; g.fill();
+    g.lineWidth = 0.2; g.strokeStyle = "rgba(255,255,255,0.13)"; g.stroke();
+    g.fillStyle = "rgba(255,255,255,0.06)";
+    for (let yy = 1; yy < h - 1; yy++) for (let xx = 1; xx < w - 1; xx++) { g.beginPath(); g.arc(xx + 0.5, yy + 0.5, 0.33, 0, Math.PI * 2); g.fill(); }
+    this.bg = bg;
+  }
+  begin() {
+    const c = this.ctx;
+    c.setTransform(1, 0, 0, 1, 0, 0); c.clearRect(0, 0, this.cv.width, this.cv.height); c.drawImage(this.bg, 0, 0);
+    c.setTransform(P * DPR, 0, 0, P * DPR, 0, 0); c.globalCompositeOperation = "lighter";
+    return c;
+  }
+  end() { this.ctx.globalCompositeOperation = "source-over"; }
+}
+const panels = { clock: new Panel("pClock"), weather: new Panel("pWeather"), poke: new Panel("pPoke"), verse: new Panel("pVerse"), ticker: new Panel("pTicker") };
+const COL = {
+  clock: "#ffe9c4", ampm: "#ffb347", weekday: "#ffcf6e", date: "#cfe2ff", title: "#ffc65c", dim: "#7d879a",
+  temp: "#7fe6ff", cond: "#f4f7ff", hi: "#ff9a6b", lo: "#7fb6ff", day: "#ffcf6e", verse: "#fff4e0", ref: "#ff9f6b",
+  team: "#f4f7ff", score: "#ffd45c", live: "#ff4d4d", final: "#8d97ab", soon: "#7fd0ff",
+};
+
+/* =====================================================================
+   Pixel-art beach scene
+   ===================================================================== */
+const PALETTES = {
+  night:     { skyTop: "#070b24", skyMid: "#111743", skyLow: "#262b60", sun: "#f3efd2", glow: "#8790c8", cloudHi: "#41477e", cloudMid: "#2c305e", cloudLo: "#1c1f42", seaFar: "#1e2b5e", seaNear: "#0b1434", seaHi: "#8e9cdc", far: "#151b40", cliffHi: "#3b3662", cliffLo: "#272349", tree: "#0f2630", treeHi: "#1b3a42", rockHi: "#4b3f68", rockMid: "#332b4e", rockLo: "#1f1a36", sandHi: "#4f4b74", sandLo: "#3b375a", wet: "#2d2b4a", foam: "#9ba5da", trunk: "#3b2f42", leaf: "#11302e", leafHi: "#1d4a45", stars: 1, reflect: 0.55 },
+  dawn:      { skyTop: "#34366f", skyMid: "#b0709f", skyLow: "#ffb18a", sun: "#ffdaa2", glow: "#ff9b7b", cloudHi: "#ffd3c5", cloudMid: "#c998c7", cloudLo: "#7e6ba7", seaFar: "#8d80b9", seaNear: "#304783", seaHi: "#ffd9b2", far: "#5b5087", cliffHi: "#ca8ba1", cliffLo: "#8b6087", tree: "#2e4b53", treeHi: "#406b63", rockHi: "#ca8371", rockMid: "#905765", rockLo: "#5b3b57", sandHi: "#eab9a1", sandLo: "#c1908b", wet: "#9b7587", foam: "#fff1e7", trunk: "#6b4b53", leaf: "#2d4b4b", leafHi: "#47715f", stars: 0.25, reflect: 0.9 },
+  morning:   { skyTop: "#509ce9", skyMid: "#8dc5f3", skyLow: "#ffe7c3", sun: "#fff7d2", glow: "#ffe1a1", cloudHi: "#ffffff", cloudMid: "#e7effd", cloudLo: "#b7c7e7", seaFar: "#5dbbe0", seaNear: "#1b7eb1", seaHi: "#ffffff", far: "#7ba1c9", cliffHi: "#e4a285", cliffLo: "#b1715f", tree: "#308b53", treeHi: "#56b16b", rockHi: "#d9916d", rockMid: "#a1614d", rockLo: "#6b3d35", sandHi: "#f9e3b1", sandLo: "#e1c18b", wet: "#caa577", foam: "#ffffff", trunk: "#8b6141", leaf: "#308b4b", leafHi: "#5dc063", stars: 0, reflect: 0.6 },
+  day:       { skyTop: "#3087ed", skyMid: "#60b1f7", skyLow: "#b9e5ff", sun: "#fffbe7", glow: "#fff4b1", cloudHi: "#ffffff", cloudMid: "#eef4ff", cloudLo: "#c3d3ef", seaFar: "#3dc9e7", seaNear: "#118fc5", seaHi: "#ffffff", far: "#8bb5d9", cliffHi: "#e9a989", cliffLo: "#b97561", tree: "#2d9b51", treeHi: "#5bc56b", rockHi: "#e19b73", rockMid: "#a9674f", rockLo: "#6f3f35", sandHi: "#fceabd", sandLo: "#e9c991", wet: "#d1ae7d", foam: "#ffffff", trunk: "#956940", leaf: "#309b4b", leafHi: "#67cd67", stars: 0, reflect: 0.45 },
+  afternoon: { skyTop: "#3f87e7", skyMid: "#90bff1", skyLow: "#ffe1a7", sun: "#fff1c1", glow: "#ffd57b", cloudHi: "#fff7e9", cloudMid: "#f3ddcd", cloudLo: "#c9b1a7", seaFar: "#47b7d0", seaNear: "#167f9f", seaHi: "#fff3c5", far: "#9ba9c5", cliffHi: "#efa37f", cliffLo: "#b96b53", tree: "#308b49", treeHi: "#63b55f", rockHi: "#e9956b", rockMid: "#ad5f47", rockLo: "#6f3931", sandHi: "#fbe1ab", sandLo: "#e5bd81", wet: "#cda06f", foam: "#fffbf1", trunk: "#90613d", leaf: "#308747", leafHi: "#65b75b", stars: 0, reflect: 0.65 },
+  sunset:    { skyTop: "#f08c7d", skyMid: "#faa37f", skyLow: "#ffca8f", sun: "#fff8b9", glow: "#ffe58b", cloudHi: "#ece1ff", cloudMid: "#baa6ed", cloudLo: "#8b77d0", seaFar: "#3cbdbd", seaNear: "#1b8da3", seaHi: "#ffe781", far: "#c97d91", cliffHi: "#ef8b85", cliffLo: "#b95b65", tree: "#38754b", treeHi: "#58995b", rockHi: "#f1975f", rockMid: "#c5614b", rockLo: "#883d37", sandHi: "#f9c99b", sandLo: "#dd9f73", wet: "#ba8067", foam: "#fff5e1", trunk: "#8b4b3b", leaf: "#306f49", leafHi: "#5b9b57", stars: 0, reflect: 1 },
+  dusk:      { skyTop: "#24265f", skyMid: "#5b4493", skyLow: "#e3867d", sun: "#ffb58b", glow: "#ff8b7b", cloudHi: "#c79bd3", cloudMid: "#8b65ad", cloudLo: "#503e7d", seaFar: "#4d609f", seaNear: "#1d2f63", seaHi: "#f5a9a1", far: "#3b3367", cliffHi: "#9b6189", cliffLo: "#6b4171", tree: "#203543", treeHi: "#2f4d53", rockHi: "#a1616b", rockMid: "#6f4159", rockLo: "#3f2941", sandHi: "#a17d97", sandLo: "#7f6183", wet: "#5f4b6d", foam: "#e9c9d9", trunk: "#4b3141", leaf: "#1d3539", leafHi: "#2d4d4b", stars: 0.45, reflect: 0.8 },
+};
+const PAL_RGB = {};
+for (const [k, p] of Object.entries(PALETTES)) {
+  PAL_RGB[k] = {};
+  for (const [f, v] of Object.entries(p)) PAL_RGB[k][f] = typeof v === "string" ? hex2rgb(v) : v;
+}
+function blendPal(a, b, t) {
+  const out = {};
+  for (const f of Object.keys(a)) out[f] = Array.isArray(a[f]) ? mix(a[f], b[f], t) : lerp(a[f], b[f], t);
+  return out;
+}
+
+const scene = (() => {
+  const cv = document.getElementById("scene"), ctx = cv.getContext("2d");
+  let W = 320, H = 200;
+  const HOR = 92;
+  const layers = { sky: document.createElement("canvas"), land: document.createElement("canvas"), fore: document.createElement("canvas") };
+  let pal = PAL_RGB.day, staticKey = "", clouds = [], wx = "clear";
+  const rnd = mulberry32(7);
+  const stars = Array.from({ length: 80 }, () => ({ x: rnd(), y: rnd() * 0.85, p: rnd() * 6.28, big: rnd() < 0.12 }));
+  const sparkles = Array.from({ length: 46 }, () => ({ x: rnd(), y: rnd(), p: rnd() * 6.28, v: (rnd() - 0.5) * 6 }));
+  const bubbles = Array.from({ length: 5 }, () => ({ x: 0, y: -1, r: 2, v: 4, p: rnd() * 6.28 }));
+  const drops = Array.from({ length: 150 }, () => ({ x: rnd(), y: rnd() }));
+  let flashUntil = 0, nextFlash = 0;
+
+  const shore = (x) => 167 + 3 * Math.sin(x * 0.045) + 2 * Math.sin(x * 0.11 + 1.3);
+
+  function sunTimes(t) {
+    const sr = (WX && WX.sunrise) ? new Date(WX.sunrise) : null, ss = (WX && WX.sunset) ? new Date(WX.sunset) : null;
+    const base = new Date(t); base.setHours(0, 0, 0, 0);
+    const min = (d, fallback) => d ? d.getHours() * 60 + d.getMinutes() : fallback;
+    return { sr: min(sr, 7 * 60), ss: min(ss, 19 * 60) };
+  }
+  function paletteAt(t) {
+    const m = t.getHours() * 60 + t.getMinutes() + t.getSeconds() / 60;
+    const { sr, ss } = sunTimes(t);
+    const keys = [[sr - 75, "night"], [sr - 12, "dawn"], [sr + 55, "morning"], [Math.min(sr + 170, (sr + ss) / 2), "day"],
+      [Math.max(ss - 170, (sr + ss) / 2), "day"], [ss - 85, "afternoon"], [ss - 12, "sunset"], [ss + 28, "dusk"], [ss + 85, "night"]];
+    if (m <= keys[0][0] || m >= keys[keys.length - 1][0]) return PAL_RGB.night;
+    for (let i = 0; i < keys.length - 1; i++) {
+      const [m0, k0] = keys[i], [m1, k1] = keys[i + 1];
+      if (m >= m0 && m <= m1) return blendPal(PAL_RGB[k0], PAL_RGB[k1], m1 > m0 ? smooth(0, 1, (m - m0) / (m1 - m0)) : 1);
+    }
+    return PAL_RGB.day;
+  }
+  function weatherKind() {
+    const w = DEBUG.weather || (WX ? WX.icon : "sun");
+    return { sun: "clear", moon: "clear", clear: "clear", partSun: "partly", partMoon: "partly", partly: "partly", cloud: "cloudy", cloudy: "cloudy",
+      fog: "fog", rain: "rain", snow: "snow", storm: "storm" }[w] || "clear";
+  }
+
+  /* ----- static layers (rebuilt every minute or when the palette changes) ----- */
+  function pixelLayer(c) {
+    c.width = W; c.height = H;
+    const g = c.getContext("2d"), d = g.createImageData(W, H);
+    return { g, d, set(x, y, col, a = 255) { if (x < 0 || y < 0 || x >= W || y >= H) return; const i = (y * W + x) * 4; d.data[i] = col[0]; d.data[i + 1] = col[1]; d.data[i + 2] = col[2]; d.data[i + 3] = a; }, flush() { g.putImageData(d, 0, 0); } };
+  }
+  function overcast(c, amt) { const l = 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2]; return mix(c, [l * 0.95, l * 0.97, l * 1.02].map(Math.round), amt); }
+
+  function buildStatic() {
+    const grey = { clear: 0, partly: 0.05, cloudy: 0.45, fog: 0.45, rain: 0.5, snow: 0.38, storm: 0.62 }[wx];
+    const S = (c) => grey ? overcast(c, grey) : c;
+    // Sky with dithered bands
+    const sky = pixelLayer(layers.sky);
+    for (let y = 0; y < HOR + 1; y++) for (let x = 0; x < W; x++) {
+      const t = y / HOR, lv = 14, v = t * lv, b = Math.floor(v), q = (v - b) > bayer(x, y) ? b + 1 : b, tt = Math.min(1, q / lv);
+      const col = tt < 0.55 ? mix(pal.skyTop, pal.skyMid, smooth(0, 1, tt / 0.55)) : mix(pal.skyMid, pal.skyLow, smooth(0, 1, (tt - 0.55) / 0.45));
+      sky.set(x, y, S(col));
+    }
+    sky.flush();
+
+    // Far land + sea
+    const land = pixelLayer(layers.land);
+    for (let y = HOR; y < H; y++) for (let x = 0; x < W; x++) {
+      const t = (y - HOR) / (H - HOR), lv = 10, v = Math.pow(t, 0.75) * lv, b = Math.floor(v), q = (v - b) > bayer(x, y) ? b + 1 : b;
+      let col = mix(pal.seaFar, pal.seaNear, Math.min(1, q / lv));
+      if (y === HOR) col = mix(col, pal.skyLow, 0.45);
+      const h = hash2(x >> 2, y, 3);
+      if (y % 2 === 0 && h < 0.07) col = mix(col, pal.seaNear, 0.35);
+      else if (h > 0.965) col = mix(col, pal.seaHi, 0.18);
+      land.set(x, y, S(col));
+    }
+    const haze = (c, a) => S(mix(c, pal.skyLow, a));
+    for (let x = 18; x < 98; x++) {                                 // small far island
+      const hgt = Math.round(5 * Math.sin(Math.PI * (x - 18) / 80) + (x > 44 && x < 70 ? 2 : 0));
+      for (let y = HOR - hgt; y < HOR; y++) land.set(x, y, haze(y === HOR - hgt ? mix(pal.far, pal.skyLow, 0.2) : pal.far, 0.38));
+    }
+    const hx = Math.round(W * 0.8) + 6;                             // headland on the right, past where the sun sets
+    for (let x = hx; x < W; x++) {
+      const h = Math.round(30 * smooth(hx, hx + 44, x) + 4 * smooth(hx + 44, W, x) + 1.6 * Math.sin(x * 0.37) + 1.2 * Math.sin(x * 0.93 + 2));
+      if (h < 1) continue;
+      const top = HOR - h, tb = Math.max(2, Math.round(h * 0.3));
+      for (let y = top; y < HOR; y++) {
+        let col;
+        if (y < top + tb) col = (hash2(x, y, 9) > 0.55 || y === top) ? pal.treeHi : pal.tree;
+        else if (y >= HOR - 2 && h > 6) col = pal.sandHi;
+        else { const f = (y - top - tb) / Math.max(1, HOR - top - tb); col = ((x + (y >> 2)) % 5 < 2) ? pal.cliffHi : pal.cliffLo; col = mix(col, pal.cliffLo, f * 0.5); }
+        land.set(x, y, haze(col, 0.2));
+      }
+    }
+    land.flush();
+
+    // Foreground: sea stack + arch on the left, sandy beach along the bottom
+    const fore = pixelLayer(layers.fore);
+    const blobs = [{ cx: 30, cy: 132, rx: 15, ry: 38 }, { cx: 52, cy: 152, rx: 22, ry: 19 }, { cx: 78, cy: 158, rx: 18, ry: 13 }, { cx: 14, cy: 162, rx: 20, ry: 11 }];
+    const hole = { cx: 63, cy: 162, rx: 8, ry: 9 };
+    for (let y = 80; y < 180; y++) for (let x = 0; x < 110; x++) {
+      if (((x - hole.cx) / hole.rx) ** 2 + ((y - hole.cy) / hole.ry) ** 2 < 1 && y > 150) continue;
+      let best = null, bd = 9;
+      for (const b of blobs) { const d = ((x - b.cx) / b.rx) ** 2 + ((y - b.cy) / b.ry) ** 2; if (d < 1 && d < bd) { bd = d; best = b; } }
+      if (!best) continue;
+      const nx = (x - best.cx) / best.rx, ny = (y - best.cy) / best.ry;
+      const light = -0.65 * nx - 0.75 * ny + (hash2(x >> 1, y >> 1, 5) - 0.5) * 0.35;
+      let col = light > 0.32 + bayer(x, y) * 0.2 ? pal.rockHi : light > -0.3 + bayer(x, y) * 0.2 ? pal.rockMid : pal.rockLo;
+      if (y % 7 === 0 && hash2(x >> 3, y, 1) > 0.4) col = mix(col, pal.rockLo, 0.5);
+      fore.set(x, y, col);
+    }
+    for (let x = 0; x < W; x++) {
+      const ys = Math.round(shore(x));
+      for (let y = ys + 1; y < H; y++) {
+        let col = (hash2(x, y, 11) + bayer(x, y) * 0.5) > 0.9 ? pal.sandLo : pal.sandHi;
+        if (y <= ys + 3) col = pal.wet;
+        else if (hash2(x, y, 12) > 0.985) col = mix(pal.sandLo, pal.rockLo, 0.4);
+        fore.set(x, y, col);
+      }
+    }
+    fore.flush();
+
+    // Clouds
+    const count = { clear: 3, partly: 6, cloudy: 10, fog: 8, rain: 10, snow: 9, storm: 11 }[wx];
+    const cgrey = { clear: 0, partly: 0, cloudy: 0.35, fog: 0.45, rain: 0.5, snow: 0.25, storm: 0.65 }[wx];
+    clouds = [];
+    for (let i = 0; i < count; i++) {
+      const r = mulberry32(100 + i * 17);
+      const w = 34 + Math.floor(r() * 46), h = 16 + Math.floor(r() * 8);
+      const cc = document.createElement("canvas"); cc.width = w; cc.height = h;
+      const g = cc.getContext("2d"), d = g.createImageData(w, h), mask = new Uint8Array(w * h);
+      const n = 4 + Math.floor(r() * 4), circles = [];
+      for (let k = 0; k < n; k++) {
+        const t = n === 1 ? 0.5 : k / (n - 1), rad = 4 + (1 - Math.abs(t - 0.5) * 1.6) * (4 + r() * 5);
+        circles.push({ x: 5 + t * (w - 10) + (r() - 0.5) * 4, y: h - 3 - rad * 0.75, r: rad });
+      }
+      for (let y = 0; y < h - 1; y++) for (let x = 0; x < w; x++) if (circles.some((c) => (x - c.x) ** 2 + (y - c.y) ** 2 < c.r * c.r)) mask[y * w + x] = 1;
+      const M = (x, y) => x >= 0 && y >= 0 && x < w && y < h && mask[y * w + x];
+      const hi = overcast(pal.cloudHi, cgrey), mid = overcast(pal.cloudMid, cgrey), lo = overcast(pal.cloudLo, cgrey);
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        if (!M(x, y)) continue;
+        let col = mid;
+        if (!M(x, y - 2) || (!M(x - 2, y - 1) && bayer(x, y) > 0.4)) col = hi;
+        else if (!M(x, y + 2) || y > h - 5) col = lo;
+        const i = (y * w + x) * 4; d.data[i] = col[0]; d.data[i + 1] = col[1]; d.data[i + 2] = col[2]; d.data[i + 3] = 255;
+      }
+      g.putImageData(d, 0, 0);
+      clouds.push({ c: cc, w, x0: r() * (W + 120), y: 6 + Math.floor(r() * (wx === "clear" || wx === "partly" ? 50 : 66)), v: 0.8 + r() * 1.6 });
+    }
+  }
+
+  /* ----- dynamic bits, drawn every frame ----- */
+  function px(x, y, col, a = 1) { ctx.fillStyle = rgb(col, a); ctx.fillRect(x | 0, y | 0, 1, 1); }
+  function bodyPos(t) {
+    const m = t.getHours() * 60 + t.getMinutes() + t.getSeconds() / 60;
+    const { sr, ss } = sunTimes(t);
+    let f, isSun = true;
+    if (m >= sr && m <= ss) f = (m - sr) / (ss - sr);
+    else { isSun = false; const nightLen = 1440 - (ss - sr); f = ((m - ss + 1440) % 1440) / nightLen; }
+    const x = lerp(W * 0.2, W * 0.8, f), y = HOR + 3 - Math.sin(Math.PI * f) * (HOR - 22);
+    return { x, y, isSun, f };
+  }
+  function drawSun(b, T) {
+    const vis = { clear: 1, partly: 1, cloudy: 0.3, fog: 0.3, rain: 0.18, snow: 0.3, storm: 0.1 }[wx];
+    const px = (x, y, col, a = 1) => { ctx.fillStyle = rgb(col, a * vis); ctx.fillRect(x | 0, y | 0, 1, 1); };
+    const low = 1 - Math.sin(Math.PI * b.f);
+    const R = 8 + low * 3;
+    const core = b.isSun ? mix(pal.sun, [255, 190, 110], low * 0.35) : pal.sun;
+    for (let y = -R - 9; y <= R + 9; y++) for (let x = -R - 9; x <= R + 9; x++) {
+      const d = Math.hypot(x, y), X = Math.round(b.x + x), Y = Math.round(b.y + y);
+      if (Y >= HOR + 1) continue;
+      if (d < R) {
+        if (!b.isSun) { // crescent moon
+          if (Math.hypot(x + 4, y - 2) < R - 1) continue;
+          px(X, Y, mix(core, [255, 255, 255], d < R - 3 ? 0.2 : 0));
+        } else px(X, Y, d < R - 3 ? mix(core, [255, 255, 255], 0.4) : core);
+      } else {
+        const ring = (d - R) / 9, alpha = (b.isSun ? 0.55 : 0.25) * (1 - ring);
+        if (alpha > bayer(X, Y) * 0.9) px(X, Y, pal.glow, 0.55);
+      }
+    }
+  }
+  function drawPalm(T) {
+    const base = { x: 304, y: 199 }, top = { x: 289, y: 95 };
+    for (let i = 0; i <= 120; i++) {
+      const t = i / 120, x = lerp(base.x, top.x, Math.pow(t, 1.5)), y = lerp(base.y, top.y, t), w = 4.4 - t * 1.6;
+      for (let k = 0; k < w; k++) {
+        let col = ((Math.round(y) >> 2) % 2 === 0) ? pal.trunk : mix(pal.trunk, [0, 0, 0], 0.25);
+        if (k < 1) col = mix(col, [255, 255, 255], 0.12);
+        px(x - w / 2 + k, y, col);
+      }
+    }
+    const leaves = [[-2.9, 24, 0.55], [-2.35, 22, 0.35], [-1.75, 17, 0.2], [-1.15, 18, 0.3], [-0.5, 24, 0.45], [0.15, 22, 0.6], [-3.4, 18, 0.75]];
+    leaves.forEach(([ang, len, droop], i) => {
+      const a = ang + Math.sin(T * 0.9 + i * 1.7) * 0.05;
+      const dx = Math.cos(a), dy = Math.sin(a);
+      for (let s = 0; s <= len; s++) {
+        const t = s / len, x = top.x + dx * s, y = top.y + dy * s + droop * t * t * len;
+        px(x, y, pal.leaf); px(x, y + 1, pal.leaf); px(x, y - 1, pal.leafHi, 0.9);
+        if (s % 2 === 0 && s > 2) px(x + (dx > 0 ? -1 : 1), y + 2, pal.leaf);
+      }
+    });
+    [[287, 98], [290, 99], [288, 101]].forEach(([x, y]) => { px(x, y, [110, 70, 40]); px(x + 1, y, [90, 55, 30]); px(x, y + 1, [80, 50, 28]); });
+  }
+
+  function frame() {
+    const t = now(), T = performance.now() / 1000;
+    const kind = weatherKind();
+    const key = `${t.getHours()}:${t.getMinutes()}:${Math.floor(t.getSeconds() / (DEBUG.demo ? 1 : 60))}|${kind}|${W}`;
+    if (key !== staticKey) { pal = paletteAt(t); wx = kind; buildStatic(); staticKey = key; }
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(layers.sky, 0, 0);
+
+    if (pal.stars > 0.02 && wx !== "cloudy" && wx !== "rain" && wx !== "storm") {
+      for (const s of stars) {
+        const a = pal.stars * (0.55 + 0.45 * Math.sin(T * 2.2 + s.p));
+        const x = s.x * W, y = s.y * (HOR - 10);
+        px(x, y, [255, 255, 240], a);
+        if (s.big && a > 0.7) { px(x - 1, y, [255, 255, 240], a * 0.4); px(x + 1, y, [255, 255, 240], a * 0.4); px(x, y - 1, [255, 255, 240], a * 0.4); px(x, y + 1, [255, 255, 240], a * 0.4); }
+      }
+    }
+    const body = bodyPos(t);
+    drawSun(body, T);
+    for (const c of clouds) {
+      const span = W + c.w + 40, x = ((c.x0 + T * c.v) % span) - c.w - 20;
+      ctx.drawImage(c.c, Math.round(x), c.y);
+    }
+    ctx.drawImage(layers.land, 0, 0);
+
+    // light path on the water + sparkles
+    const strength = pal.reflect * (body.y < HOR ? 1 : 0) * (body.isSun ? 1 : 0.6) * ({ cloudy: 0.35, rain: 0.2, storm: 0.1, fog: 0.3 }[wx] ?? 1);
+    const tick = Math.floor(T * 6), refl = mix(pal.seaHi, pal.sun, 0.35);
+    for (let y = HOR + 1; y < 165; y++) {
+      const tt = (y - HOR) / (165 - HOR), half = 3 + tt * 24 * (0.6 + 0.4 * (1 - Math.sin(Math.PI * body.f)));
+      for (let k = 0; k < 2; k++) {
+        if (hash2(y, k, tick) > strength * (0.95 - tt * 0.45)) continue;
+        const sx = body.x + (hash2(y, k + 7, tick) - 0.5) * 2 * half, len = 1 + Math.floor(hash2(y, k + 3, tick) * 5);
+        ctx.fillStyle = rgb(refl, 0.85); ctx.fillRect(Math.round(sx), y, len, 1);
+      }
+    }
+    for (const s of sparkles) {
+      if (Math.sin(T * 2.6 + s.p) < 0.55) continue;
+      const x = ((s.x * W + T * s.v) % W + W) % W, y = HOR + 4 + s.y * 62;
+      ctx.fillStyle = rgb(pal.seaHi, 0.7); ctx.fillRect(Math.round(x), Math.round(y), 2 + (s.p > 3 ? 1 : 0), 1);
+    }
+    // floating bubbles
+    for (const b of bubbles) {
+      if (b.y < 30 || b.y < 0) { const r = Math.random; b.x = 30 + r() * (W - 60); b.y = 150 + r() * 14; b.r = 2 + Math.floor(r() * 3); b.v = 3 + r() * 4; }
+      b.y -= b.v / 12.5; const x = b.x + Math.sin(T * 1.3 + b.p) * 3;
+      for (let a = 0; a < 24; a++) { const ang = (a / 24) * Math.PI * 2; px(x + Math.cos(ang) * b.r, b.y + Math.sin(ang) * b.r, mix(pal.seaHi, [255, 255, 255], 0.5), 0.75); }
+      px(x - b.r * 0.4, b.y - b.r * 0.5, [255, 255, 255], 0.95);
+    }
+    ctx.drawImage(layers.fore, 0, 0);
+    // waves lapping on the sand
+    for (let x = 0; x < W; x++) {
+      const y = Math.round(shore(x) + 1.3 * Math.sin(T * 0.9 + x * 0.03));
+      if (hash2(x >> 1, Math.floor(T * 2.5), 21) > 0.28) px(x, y, pal.foam, 0.95);
+      px(x, y - 1, pal.seaHi, 0.35);
+    }
+    drawPalm(T);
+
+    // weather
+    if (wx === "rain" || wx === "storm") {
+      ctx.fillStyle = "rgba(205,222,255,0.55)";
+      for (const d of drops) { d.y += 0.045; d.x -= 0.008; if (d.y > 1) { d.y -= 1; d.x = Math.random() * 1.1; } ctx.fillRect(Math.round(((d.x % 1) + 1) % 1 * W), Math.round(d.y * H), 1, 3); }
+    }
+    if (wx === "snow") {
+      ctx.fillStyle = "rgba(255,255,255,0.9)";
+      for (const d of drops.slice(0, 90)) { d.y += 0.004; if (d.y > 1) d.y -= 1; ctx.fillRect(Math.round(((d.x * W + Math.sin(T + d.x * 20) * 3) % W + W) % W), Math.round(d.y * H), 1, 1); }
+    }
+    if (wx === "fog") { const g = ctx.createLinearGradient(0, HOR - 40, 0, HOR + 40); g.addColorStop(0, "rgba(220,225,235,0)"); g.addColorStop(0.5, "rgba(220,225,235,0.45)"); g.addColorStop(1, "rgba(220,225,235,0)"); ctx.fillStyle = g; ctx.fillRect(0, HOR - 40, W, 80); }
+    if (wx === "storm") {
+      if (T > nextFlash) { flashUntil = T + 0.12; nextFlash = T + 8 + Math.random() * 14; }
+      if (T < flashUntil) { ctx.fillStyle = "rgba(255,255,255,0.35)"; ctx.fillRect(0, 0, W, H); }
+    }
+  }
+
+  return {
+    resize(w, h) { W = w; H = h; cv.width = W; cv.height = H; staticKey = ""; },
+    frame,
+  };
+})();
+
+/* =====================================================================
+   Data: weather, scores, Pokémon of the day, verse of the day
+   ===================================================================== */
+let WX = null, GAMES = [], POKE = null, VERSE = null;
+
+function wmo(code, isDay = 1) {
+  const day = !!isDay;
+  if (code === 0) return { label: "Clear", icon: day ? "sun" : "moon" };
+  if (code === 1) return { label: "Mostly clear", icon: day ? "sun" : "moon" };
+  if (code === 2) return { label: "Partly cloudy", icon: day ? "partSun" : "partMoon" };
+  if (code === 3) return { label: "Cloudy", icon: "cloud" };
+  if (code === 45 || code === 48) return { label: "Fog", icon: "fog" };
+  if (code >= 51 && code <= 57) return { label: "Drizzle", icon: "rain" };
+  if (code >= 61 && code <= 67) return { label: code >= 65 ? "Heavy rain" : "Rain", icon: "rain" };
+  if (code >= 71 && code <= 77) return { label: "Snow", icon: "snow" };
+  if (code >= 80 && code <= 82) return { label: "Showers", icon: "rain" };
+  if (code === 85 || code === 86) return { label: "Snow showers", icon: "snow" };
+  if (code >= 95) return { label: "Storms", icon: "storm" };
+  return { label: "-", icon: "cloud" };
+}
+
+async function getLocation() {
+  if (CONFIG.lat != null && CONFIG.lon != null) return { lat: CONFIG.lat, lon: CONFIG.lon };
+  const key = "dash-loc:" + CONFIG.city + "|" + CONFIG.region;
+  const cached = cacheGet(key); if (cached) return cached;
+  const data = await getJSON(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(CONFIG.city)}&count=10&language=en&format=json`);
+  const want = CONFIG.region.trim().toLowerCase(), results = data.results || [];
+  const m = results.find((r) => !want || [r.admin1, r.country, r.country_code].some((v) => v && v.toLowerCase() === want)) || results[0];
+  if (!m) throw new Error("City not found");
+  const loc = { lat: m.latitude, lon: m.longitude }; cacheSet(key, loc); return loc;
+}
+
+async function refreshWeather() {
+  try {
+    const { lat, lon } = await getLocation();
+    const unit = CONFIG.units === "celsius" ? "celsius" : "fahrenheit";
+    const w = await getJSON("https://api.open-meteo.com/v1/forecast?latitude=" + lat + "&longitude=" + lon +
+      "&current=temperature_2m,weather_code,is_day&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset" +
+      "&temperature_unit=" + unit + "&timezone=auto&forecast_days=4");
+    const c = w.current, d = w.daily, info = wmo(c.weather_code, c.is_day);
+    WX = {
+      temp: c.temperature_2m, icon: info.icon, label: info.label, hi: d.temperature_2m_max[0], lo: d.temperature_2m_min[0],
+      sunrise: d.sunrise[0], sunset: d.sunset[0],
+      days: [1, 2, 3].map((i) => ({ name: new Date(d.time[i] + "T12:00:00").toLocaleDateString("en-US", { weekday: "short" }).toUpperCase(),
+        icon: wmo(d.weather_code[i], 1).icon, hi: d.temperature_2m_max[i], lo: d.temperature_2m_min[i] })),
+    };
+  } catch (e) { /* keep last good weather */ }
+  renderWeather();
+}
+
+function parseEvent(e, key) {
+  const comp = e.competitions[0];
+  const teams = comp.competitors.map((x) => ({ side: x.homeAway, abbr: x.team.abbreviation || x.team.shortDisplayName, score: x.score }));
+  const away = teams.find((t) => t.side === "away") || teams[0], home = teams.find((t) => t.side === "home") || teams[1];
+  const st = e.status.type;
+  return { league: key, date: new Date(e.date), state: st.state, detail: st.shortDetail, away, home };
+}
+let scoresTimer = null;
+async function refreshScores() {
+  clearTimeout(scoresTimer);
+  const res = await Promise.allSettled(CONFIG.leagues.map(async (key) => {
+    const data = await getJSON(`https://site.api.espn.com/apis/site/v2/sports/${LEAGUES[key].path}/scoreboard`);
+    return (data.events || []).map((e) => parseEvent(e, key));
+  }));
+  const ok = res.filter((r) => r.status === "fulfilled");
+  if (ok.length) { GAMES = ok.flatMap((r) => r.value); ticker.setItems(buildTicker(GAMES)); }
+  scoresTimer = setTimeout(refreshScores, (GAMES.some((g) => g.state === "in") ? 30 : 120) * 1000);
+}
+
+/* ----- Pokémon of the day ----- */
+const TYPE_COLORS = { normal: "#c8c89a", fire: "#ff8a45", water: "#5aa8ff", electric: "#ffd83f", grass: "#72dc5c", ice: "#9feaea", fighting: "#ff6a5a",
+  poison: "#d36ae0", ground: "#e8c56f", flying: "#b3a2ff", psychic: "#ff72a8", bug: "#bcd03a", rock: "#d4bc5c", ghost: "#9d82d8", dragon: "#8f73ff",
+  dark: "#b39a86", steel: "#c6c6dc", fairy: "#ffa2dc" };
+function dailyPokemonId(d = now()) { return 1 + Math.floor(mulberry32(hashStr("pkmn" + todayKey(d)))() * 1025); }
+async function loadPokemon(id, useCache = true) {
+  const ck = "dash-pkmn:" + id;
+  let p = useCache ? cacheGet(ck) : null;
+  if (!p) {
+    const [mon, sp] = await Promise.all([getJSON(`https://pokeapi.co/api/v2/pokemon/${id}`), getJSON(`https://pokeapi.co/api/v2/pokemon-species/${id}`)]);
+    const en = (arr) => (arr.find((x) => x.language.name === "en") || {});
+    const s = mon.sprites || {}, bw = (((s.versions || {})["generation-v"] || {})["black-white"] || {}).animated || {};
+    p = { id, name: en(sp.names).name || mon.name, genus: en(sp.genera).genus || "", types: mon.types.sort((a, b) => a.slot - b.slot).map((t) => t.type.name),
+      sprite: bw.front_default || ((s.other || {}).showdown || {}).front_default || s.front_default };
+    cacheSet(ck, p);
+  }
+  POKE = p;
+  const img = document.getElementById("sprite");
+  img.onload = placeSprite; img.src = p.sprite;
+  renderPoke();
+}
+function placeSprite() {
+  const img = document.getElementById("sprite"), pn = panels.poke;
+  if (!img.naturalWidth || !pn.w) return;
+  const area = { x: pn.x + 4, y: pn.y + 22, w: 56, h: pn.h - 25 };
+  let k = Math.min(area.w * P / img.naturalWidth, area.h * P / img.naturalHeight);
+  if (k >= 2) k = Math.floor(k);
+  const w = img.naturalWidth * k, h = img.naturalHeight * k;
+  Object.assign(img.style, { width: w + "px", height: h + "px", left: (area.x * P + (area.w * P - w) / 2) + "px", top: (area.y * P + area.h * P - h) + "px" });
+}
+
+/* ----- Verse of the day ----- */
+const VERSES = ["John 3:16", "Philippians 4:13", "Jeremiah 29:11", "Proverbs 3:5-6", "Romans 8:28", "Isaiah 41:10", "Psalm 23:1-3", "Joshua 1:9",
+  "Matthew 11:28-29", "2 Timothy 1:7", "Psalm 46:1", "Psalm 46:10", "Romans 12:2", "Galatians 5:22-23", "Hebrews 11:1", "1 Corinthians 13:4-5",
+  "Psalm 118:24", "Lamentations 3:22-23", "Isaiah 40:31", "Matthew 6:33", "John 14:6", "John 16:33", "Romans 15:13", "2 Corinthians 5:17",
+  "Ephesians 2:8-9", "Philippians 4:6-7", "Colossians 3:23", "1 Peter 5:7", "James 1:5", "Psalm 37:4", "Psalm 119:105", "Proverbs 16:3",
+  "Micah 6:8", "Zephaniah 3:17", "Deuteronomy 31:6", "Numbers 6:24-26", "Psalm 27:1", "Psalm 34:8", "Psalm 55:22", "Psalm 91:1-2",
+  "Psalm 121:1-2", "Psalm 136:1", "Psalm 139:14", "Psalm 145:18", "Proverbs 18:10", "Proverbs 17:17", "Isaiah 26:3", "Isaiah 43:2",
+  "Isaiah 55:8-9", "Matthew 5:14-16", "Matthew 7:7", "Matthew 19:26", "Matthew 28:20", "Mark 9:23", "Luke 1:37", "Luke 6:31", "John 1:5",
+  "John 8:12", "John 10:10", "John 11:25", "John 13:34", "John 14:27", "John 15:5", "John 15:13", "Acts 1:8", "Romans 5:8", "Romans 6:23",
+  "Romans 8:31", "Romans 10:9", "Romans 12:12", "1 Corinthians 10:13", "1 Corinthians 16:14", "2 Corinthians 4:18", "2 Corinthians 12:9",
+  "Galatians 2:20", "Galatians 6:9", "Ephesians 3:20", "Ephesians 4:32", "Ephesians 6:10", "Philippians 1:6", "Philippians 4:4",
+  "Philippians 4:19", "Colossians 3:2", "1 Thessalonians 5:16-18", "2 Thessalonians 3:16", "1 Timothy 4:12", "Hebrews 4:12", "Hebrews 12:1",
+  "Hebrews 13:8", "James 1:17", "James 4:8", "1 Peter 2:9", "1 John 1:9", "1 John 4:19", "Revelation 21:4", "Psalm 19:1", "Psalm 16:11",
+  "Psalm 28:7", "Psalm 30:5", "Psalm 32:8", "Psalm 51:10", "Psalm 73:26", "Psalm 100:4-5", "Psalm 103:12", "Psalm 107:1", "Psalm 147:3",
+  "Proverbs 4:23", "Proverbs 15:1", "Proverbs 22:6", "Ecclesiastes 3:1", "Isaiah 9:6", "Isaiah 12:2", "Isaiah 40:8", "Jeremiah 17:7-8",
+  "Nahum 1:7", "Habakkuk 3:19", "Matthew 5:9", "Matthew 6:34", "John 1:1", "Romans 1:16", "Romans 8:38-39", "2 Corinthians 9:7",
+  "Ephesians 2:10", "Colossians 3:15", "Hebrews 10:23", "Hebrews 13:5", "1 John 3:18", "Psalm 62:1-2", "Psalm 63:1", "Psalm 84:11",
+  "Psalm 90:12", "Psalm 113:3", "Psalm 143:8", "Proverbs 16:9", "Isaiah 30:15", "Isaiah 58:11", "Joshua 24:15", "1 Samuel 16:7",
+  "2 Chronicles 7:14", "Nehemiah 8:10", "Job 19:25"];
+function dailyVerseRef(d = now()) {
+  if (DEBUG.verse) return DEBUG.verse;
+  const start = new Date(d.getFullYear(), 0, 0), doy = Math.floor((d - start) / 86400e3);
+  return VERSES[(doy + d.getFullYear()) % VERSES.length];
+}
+async function loadVerse() {
+  const ref = dailyVerseRef(), ck = `dash-verse:${CONFIG.bibleTranslation}:${ref}`;
+  let v = cacheGet(ck);
+  if (!v) {
+    try {
+      const d = await getJSON(`https://bible-api.com/${encodeURIComponent(ref)}?translation=${encodeURIComponent(CONFIG.bibleTranslation)}`);
+      v = { ref: d.reference, text: d.text }; cacheSet(ck, v);
+    } catch (e) { v = { ref: "John 3:16", text: "For God so loved the world, that he gave his only begotten Son, that whosoever believeth in him should not perish, but have everlasting life." }; }
+  }
+  VERSE = { ref: cleanText(v.ref), text: cleanText(v.text), page: 0 };
+  VERSE.lines = wrapText(VERSE.text, panels.verse.w - 8);
+  renderVerse();
+}
+function wrapText(text, maxW) {
+  const lines = []; let line = "";
+  for (const word of text.split(" ")) {
+    const test = line ? line + " " + word : word;
+    if (textWidth(test) <= maxW) { line = test; continue; }
+    if (line) lines.push(line);
+    line = word;
+    while (textWidth(line) > maxW) { let cut = line.length - 1; while (cut > 1 && textWidth(line.slice(0, cut)) > maxW) cut--; lines.push(line.slice(0, cut)); line = line.slice(cut); }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+/* =====================================================================
+   Panel renderers
+   ===================================================================== */
+function renderClock() {
+  const pn = panels.clock; if (!pn.w) return;
+  const c = pn.begin(), t = now();
+  let hh = t.getHours(), ampm = "";
+  if (!CONFIG.clock24h) { ampm = hh >= 12 ? "PM" : "AM"; hh = hh % 12 || 12; }
+  const hStr = CONFIG.clock24h ? String(hh).padStart(2, "0") : String(hh), mStr = String(t.getMinutes()).padStart(2, "0");
+  const s = 4, colonOn = DEBUG.demo || t.getSeconds() % 2 === 0;
+  const timeW = textWidth(hStr, s, true) + s + 2 * s + s + textWidth(mStr, s, true), ampmW = ampm ? textWidth(ampm, 2) + 3 : 0;
+  let x = Math.round((pn.w - timeW - ampmW) / 2);
+  const y = 9;
+  x = drawText(c, hStr, x, y, s, COL.clock, { tabular: true }) + s;
+  if (colonOn) drawText(c, ":", x, y, s, COL.clock);
+  x += 2 * s + s;
+  x = drawText(c, mStr, x, y, s, COL.clock, { tabular: true });
+  if (ampm) drawText(c, ampm, x + 3, y + 1, 2, COL.ampm);
+  const wd = t.toLocaleDateString("en-US", { weekday: "long" }), md = t.toLocaleDateString("en-US", { month: "long", day: "numeric" });
+  const dateW = textWidth(wd + ", " + md);
+  const dx = drawText(c, wd + ",", Math.round((pn.w - dateW) / 2), 45, 1, COL.weekday);
+  drawText(c, md, dx + 4, 45, 1, COL.date);
+  pn.end();
+}
+
+function renderWeather() {
+  const pn = panels.weather; if (!pn.w) return;
+  const c = pn.begin();
+  if (!WX) { drawText(c, "Loading weather...", 6, 27, 1, COL.dim); pn.end(); return; }
+  drawIcon(c, ICONS[WX.icon], 5, 6, 2);
+  const tx = 38, endT = drawText(c, `${Math.round(WX.temp)}°`, tx, 6, 3, COL.temp);
+  const hx = Math.max(endT + 5, pn.w - 4 - Math.max(textWidth(`H ${Math.round(WX.hi)}°`), textWidth(`L ${Math.round(WX.lo)}°`)));
+  drawText(c, `H ${Math.round(WX.hi)}°`, hx, 7, 1, COL.hi);
+  drawText(c, `L ${Math.round(WX.lo)}°`, hx, 17, 1, COL.lo);
+  drawText(c, WX.label, tx, 30, 1, COL.cond, { maxX: pn.w - 3 });
+  const colW = Math.floor((pn.w - 8) / 3);
+  WX.days.forEach((d, i) => {
+    const x0 = 4 + i * colW, icon = ICONS_MINI[d.icon] || M_CLOUD;
+    drawIcon(c, icon, x0, 43 + Math.floor((11 - icon.length) / 2), 1);
+    const tx2 = x0 + icon[0].length + 2;
+    drawText(c, d.name, tx2, 42, 1, COL.day);
+    const e = drawText(c, `${Math.round(d.hi)}`, tx2, 52, 1, COL.cond);
+    drawText(c, `/${Math.round(d.lo)}`, e + 1, 52, 1, COL.dim, { maxX: x0 + colW });
+  });
+  pn.end();
+}
+
+function renderPoke() {
+  const pn = panels.poke; if (!pn.w) return;
+  const c = pn.begin();
+  drawText(c, "POKEMON OF THE DAY", 4, 4, 1, COL.title);
+  if (!POKE) { drawText(c, "Loading...", 4, 30, 1, COL.dim); pn.end(); return; }
+  const num = "#" + String(POKE.id).padStart(3, "0"), name = cleanText(POKE.name);
+  drawText(c, name, 4, 13, 1, "#ffffff", { maxX: pn.w - textWidth(num) - 7 });
+  drawText(c, num, pn.w - 4 - textWidth(num), 13, 1, COL.dim);
+  const rx = 63;
+  POKE.types.forEach((t, i) => drawText(c, t.toUpperCase(), rx, 26 + i * 10, 1, TYPE_COLORS[t] || "#ffffff"));
+  wrapText(cleanText(POKE.genus), pn.w - rx - 4).slice(0, 2).forEach((l, i) => drawText(c, l, rx, 47 + i * 9, 1, COL.dim));
+  pn.end();
+}
+
+function renderVerse() {
+  const pn = panels.verse; if (!pn.w) return;
+  const c = pn.begin();
+  if (!VERSE) { drawText(c, "VERSE OF THE DAY", 4, 4, 1, COL.title); drawText(c, "Loading...", 4, 30, 1, COL.dim); pn.end(); return; }
+  const title = "VERSE OF THE DAY", ref = VERSE.ref.toUpperCase();
+  if (textWidth(title) + textWidth(ref) + 8 <= pn.w - 8) { drawText(c, title, 4, 4, 1, COL.title); drawText(c, ref, pn.w - 4 - textWidth(ref), 4, 1, COL.ref); }
+  else drawText(c, ref, 4, 4, 1, COL.ref);
+  const per = Math.floor((pn.h - 15) / 10), pages = Math.max(1, Math.ceil(VERSE.lines.length / per));
+  VERSE.pages = pages; VERSE.page %= pages;
+  VERSE.lines.slice(VERSE.page * per, VERSE.page * per + per).forEach((l, i) => drawText(c, l, 4, 15 + i * 10, 1, COL.verse));
+  if (pages > 1) for (let i = 0; i < pages; i++) dot(c, pn.w - 4 - (pages - 1 - i) * 3, pn.h - 3, i === VERSE.page ? COL.title : "#3a4050");
+  pn.end();
+}
+
+/* ----- Scrolling NFL / NBA bar ----- */
+function buildTicker(games) {
+  const segs = [], rank = { in: 0, pre: 1, post: 2 };
+  for (const key of CONFIG.leagues) {
+    const list = games.filter((g) => g.league === key)
+      .sort((a, b) => (rank[a.state] - rank[b.state]) || (a.state === "post" ? b.date - a.date : a.date - b.date));
+    if (!list.length) continue;
+    segs.push([LEAGUES[key].label, LEAGUES[key].color], ["   ", COL.team]);
+    list.forEach((g) => {
+      const pre = g.state === "pre";
+      const status = pre ? (g.date.toDateString() === now().toDateString() ? fmtTime(g.date) : g.date.toLocaleDateString("en-US", { weekday: "short" }) + " " + fmtTime(g.date)) : g.state === "post" ? "FINAL" : g.detail;
+      segs.push([g.away.abbr, COL.team]);
+      if (!pre) segs.push([" " + g.away.score, COL.score]);
+      segs.push([pre ? " @ " : "  ", COL.dim], [g.home.abbr, COL.team]);
+      if (!pre) segs.push([" " + g.home.score, COL.score]);
+      segs.push(["  " + cleanText(status).toUpperCase(), g.state === "in" ? COL.live : pre ? COL.soon : COL.final], ["   •   ", COL.dim]);
+    });
+  }
+  if (!segs.length) segs.push(["NO NFL OR NBA GAMES ON THE SCHEDULE", COL.dim], ["   •   ", COL.dim]);
+  return segs;
+}
+const ticker = {
+  segs: null, pending: null, offset: 0, total: 0,
+  setItems(segs) { if (!this.segs) { this.segs = segs; this.measure(); } else this.pending = segs; },
+  measure() { this.total = this.segs.reduce((w, [t]) => w + textWidth(t.toUpperCase(), 2) + 2, 0); },
+  step() {
+    const pn = panels.ticker; if (!pn.w) return;
+    this.offset++;
+    if (this.segs && this.offset > this.total + pn.w) { this.offset = 0; if (this.pending) { this.segs = this.pending; this.pending = null; this.measure(); } }
+    const c = pn.begin();
+    if (this.segs) {
+      let x = pn.w - this.offset;
+      for (const [t, col] of this.segs) {
+        const txt = t.toUpperCase(), w = textWidth(txt, 2);
+        if (x + w > 1 && x < pn.w - 1) drawText(c, txt, x, 5, 2, col, { minX: 1, maxX: pn.w - 1 });
+        x += w + 2;
+        if (x > pn.w) break;
+      }
+    } else drawText(c, "LOADING SCORES...", 6, 5, 2, COL.dim);
+    pn.end();
+  },
+};
+
+/* =====================================================================
+   Layout + loops
+   ===================================================================== */
+function layout() {
+  DPR = window.devicePixelRatio || 1;
+  P = innerHeight / 200;
+  const W = Math.round(innerWidth / P);
+  dotCache.clear();
+  panels.clock.place(4, 4, 136, 62);
+  panels.weather.place(W - 132, 4, 128, 62);
+  panels.poke.place(4, 102, 120, 66);
+  panels.verse.place(128, 102, W - 132, 66);
+  panels.ticker.place(4, 172, W - 8, 24);
+  scene.resize(W, 200);
+  scene.frame();
+  renderClock(); renderWeather(); renderPoke(); placeSprite();
+  if (VERSE) VERSE.lines = wrapText(VERSE.text, panels.verse.w - 8);
+  renderVerse(); ticker.step();
+}
+function updateDim() {
+  const { from, to, level } = CONFIG.nightDim, h = new Date().getHours();
+  const night = from > to ? (h >= from || h < to) : (h >= from && h < to);
+  document.getElementById("dim").style.opacity = night ? level : 0;
+}
+
+let lastDay = todayKey();
+layout();
+addEventListener("resize", layout);
+setInterval(scene.frame, 80);
+setInterval(renderClock, DEBUG.demo ? 250 : 1000);
+setInterval(() => ticker.step(), 1000 / CONFIG.tickerSpeed);
+setInterval(() => { if (VERSE && VERSE.pages > 1) { VERSE.page++; renderVerse(); } }, CONFIG.versePageSeconds * 1000);
+setInterval(() => {
+  updateDim();
+  if (todayKey() !== lastDay) { lastDay = todayKey(); loadPokemon(dailyPokemonId()); loadVerse(); }
+}, 60 * 1000);
+document.getElementById("pPoke").addEventListener("click", () => loadPokemon(1 + Math.floor(Math.random() * 1025), true));
+updateDim();
+refreshWeather(); setInterval(refreshWeather, 15 * 60 * 1000);
+refreshScores();
+loadPokemon(DEBUG.pokemon ? Number(DEBUG.pokemon) : dailyPokemonId()).catch(() => { POKE = null; renderPoke(); });
+loadVerse();
+setTimeout(() => location.reload(), 6 * 3600 * 1000);
+</script>
+</body>
+</html>
